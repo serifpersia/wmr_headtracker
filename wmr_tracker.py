@@ -88,6 +88,8 @@ class Fusion:
 
                 corr_quat = R.from_rotvec(self.grav_error_axis * use_angle)
                 self.orient = corr_quat * self.orient
+                
+        self.orient = R.from_quat(self.orient.as_quat())
 
     def get_orientation(self):
         return self.orient
