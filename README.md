@@ -23,7 +23,8 @@ A simple 3DOF head tracker for Windows Mixed Reality sensors. Tracks rotation (y
 ### Windows
 
 ```bash
-./run_tracker.bat [--orientation <orientation>]
+sudo chmod +x run_tracker.sh
+sudo ./run_tracker.bat [--orientation <orientation>]
 ```
 
 *Default orientation is horizontal_right where the board its horizontally and the oculink connector is on the right hand side.
