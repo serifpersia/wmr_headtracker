@@ -17,7 +17,7 @@ A simple 3DOF head tracker for Windows Mixed Reality sensors. Tracks rotation (y
 
 ```bash
 sudo chmod +x run_tracker.sh
-sudo ./run_tracker.sh
+./run_tracker.sh
 ```
 
 ### Windows
