@@ -5,7 +5,6 @@ echo "--------------------------------------"
 echo "      WMR Headtracker Launcher        "
 echo "--------------------------------------"
 
-# Ensure python3 is available
 if ! command -v python3 &> /dev/null; then
     echo "Python 3 is not installed."
     echo "Install it with:"
@@ -14,7 +13,6 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# Detect the WMR / HoloLens USB device
 DEVICE=$(ls /dev/bus/usb/*/* 2>/dev/null | while read d; do
     if udevadm info -a -n "$d" | grep -q 'idVendor.*045e' && \
        udevadm info -a -n "$d" | grep -q 'idProduct.*0659'; then
@@ -31,12 +29,10 @@ fi
 
 echo "Detected device: $DEVICE"
 
-# Create udev rule if missing
 RULE_FILE="/etc/udev/rules.d/99-hololens.rules"
 if [ ! -f "$RULE_FILE" ]; then
     echo "Creating udev rule for WMR device (requires sudo)..."
 
-    # Detect best group automatically
     if getent group wheel >/dev/null; then
         GROUP="wheel"
     elif getent group sudo >/dev/null; then
@@ -56,7 +52,6 @@ if [ ! -f "$RULE_FILE" ]; then
     read
 fi
 
-# Set up Python virtual environment
 if [ ! -d "venv" ]; then
     echo "Creating Python virtual environment..."
     python3 -m venv venv
@@ -65,10 +60,10 @@ fi
 source venv/bin/activate
 
 echo "Installing/updating requirements..."
-pip install --upgrade pip
 pip install -r requirements.txt
 
 echo ""
-echo "Starting WMR Tracker..."
+echo "Starting WMR Tracker on Index 0..."
 echo "--------------------------------------"
-python wmr_tracker.py
+
+python wmr_tracker.py 0
