@@ -189,27 +189,6 @@ def setup_device():
         return hmd
     except: return None
 
-def calibrate(hmd):
-    print("--- CALIBRATION (2s) ---")
-    print("Keep device FLAT.")
-    packet_struct = struct.Struct("< B 4H 4Q 96h 4Q 12i 4Q")
-    collected_gyro = []
-    end_time = time.time() + 2.0
-    while time.time() < end_time:
-        data = hmd.read(497, timeout_ms=50)
-        if not data or data[0] != 1: continue
-        try:
-            unpacked = packet_struct.unpack_from(bytearray(data))
-            raw_gyro = np.array(unpacked[9:105], dtype=np.int16)
-            for i in range(4):
-                s, e = i*8, i*8+8
-                g0 = np.sum(raw_gyro[s:e]) 
-                g1 = np.sum(raw_gyro[32+s:32+e])
-                g2 = np.sum(raw_gyro[64+s:64+e])
-                collected_gyro.append([g1 * GYRO_SCALE, g2 * GYRO_SCALE, g0 * GYRO_SCALE])
-        except: pass
-    if not collected_gyro: return None
-    return np.mean(collected_gyro, axis=0)
 
 def run():
     hmd = setup_device()
@@ -222,9 +201,6 @@ def run():
     hardcoded_bias = np.array([0.00667593, 0.00111542, -0.00532668])
     fusion = FastFusion(hardcoded_bias)
 
-    fresh_bias = calibrate(hmd)
-    if fresh_bias is not None:
-        fusion.set_bias(fresh_bias)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     packet_struct = struct.Struct("< B 4H 4Q 96h 4Q 12i 4Q")
@@ -288,9 +264,6 @@ def run():
                 fy = y - offsets[0]
                 fp = p - offsets[1]
                 fr = r - offsets[2]
-
-                if fy > 180: fy -= 360
-                elif fy < -180: fy += 360
 
                 udp_struct.pack_into(udp_buffer, 0, 0.0, 0.0, 0.0, -fp, fy, -fr)
                 sock.sendto(udp_buffer, (UDP_IP, UDP_PORT))
