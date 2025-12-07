@@ -24,7 +24,6 @@ sudo chmod +x run_tracker.sh
 
 ```bash
 ./run_tracker.bat
-*Selecting correct 0 indexed sensor might fail on fresh system boot, selecting 1 then restarting the program & selecting 0 to get IMU data streaming.
 ```
 
 ## License
