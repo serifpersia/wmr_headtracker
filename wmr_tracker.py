@@ -1,23 +1,23 @@
-import collections
 import struct
 import time
 import socket
 import hid
-import numpy as np
+import math
 import sys
 import os
 
 UDP_IP = "127.0.0.1"
 UDP_PORT = 4242
 
-ACCEL_FACTOR = 0.10363 
-GYRO_SCALE = 0.001 * 0.125
-ACCEL_SCALE = (0.001 * 9.82) * ACCEL_FACTOR 
+ACCEL_FACTOR = 0.10398
+ACCEL_SCALE = 0.00982 * ACCEL_FACTOR
+GYRO_SCALE = 0.000125
 TICK_SCALE = 1e-7
 
-GRAVITY_TOLERANCE = 1.35 
+GRAVITY_TOLERANCE = 1.35
 STABILITY_THRESHOLD = 10
-FILTER_GAIN = 0.5  
+FILTER_GAIN = 0.5
+GYRO_DEADZONE = 0.0035
 
 if os.name == 'nt':
     try: import msvcrt
@@ -25,89 +25,105 @@ if os.name == 'nt':
 else:
     import select; import termios; import tty
 
-def q_mult(q1, q2):
+def normalize_q(q):
+    n = math.sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3])
+    if n > 0:
+        inv = 1.0 / n
+        q[0] *= inv; q[1] *= inv; q[2] *= inv; q[3] *= inv
+
+def q_mult_inplace(q1, w2, x2, y2, z2):
     w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        -x1*x2 - y1*y2 - z1*z2 + w1*w2,
-         x1*w2 + y1*z2 - z1*y2 + w1*x2,
-        -x1*z2 + y1*w2 + z1*x2 + w1*y2,
-         x1*y2 - y1*x2 + z1*w2 + w1*z2
-    ])
+    q1[0] = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    q1[1] = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    q1[2] = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    q1[3] = w1*z2 + x1*y2 - y1*x2 + z1*w2
 
-def q_rotate(q, v):
-    qx, qy, qz = q[1], q[2], q[3]
-    qw = q[0]
-    tx = qy*v[2] - qz*v[1]
-    ty = qz*v[0] - qx*v[2]
-    tz = qx*v[1] - qy*v[0]
-    tx += qw * v[0]; ty += qw * v[1]; tz += qw * v[2]
-    rx = qy*tz - qz*ty; ry = qz*tx - qx*tz; rz = qx*ty - qy*tx
-    return np.array([v[0] + 2.0 * rx, v[1] + 2.0 * ry, v[2] + 2.0 * rz])
-
-def q_from_rotvec(axis, angle):
-    half_angle = angle * 0.5
-    s = np.sin(half_angle)
-    return np.array([np.cos(half_angle), axis[0]*s, axis[1]*s, axis[2]*s])
+def q_rotate(q, v, out):
+    qw, qx, qy, qz = q
+    vx, vy, vz = v
+    tx = qy*vz - qz*vy
+    ty = qz*vx - qx*vz
+    tz = qx*vy - qy*vx
+    tx += qw*vx
+    ty += qw*vy
+    tz += qw*vz
+    rx = qy*tz - qz*ty
+    ry = qz*tx - qx*tz
+    rz = qx*ty - qy*tx
+    out[0] = vx + 2.0 * rx
+    out[1] = vy + 2.0 * ry
+    out[2] = vz + 2.0 * rz
 
 def q_to_euler(q):
     w, x, y, z = q
-    ysqr = y * y
-    t0 = +2.0 * (w * x + y * z)
-    t1 = +1.0 - 2.0 * (x * x + ysqr)
-    roll = np.arctan2(t0, t1)
-    t2 = +2.0 * (w * y - z * x)
-    t2 = np.clip(t2, -1.0, 1.0)
-    pitch = np.arcsin(t2)
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (ysqr + z * z)
-    yaw = np.arctan2(t3, t4)
-    return np.degrees(np.array([yaw, pitch, roll]))
+    ysqr = x * x
+    t3 = 2.0 * (w * y + z * x)
+    t4 = 1.0 - 2.0 * (ysqr + y * y)
+    yaw = math.degrees(math.atan2(t3, t4))
+    
+    t2 = 2.0 * (w * x - y * z)
+    t2 = 1.0 if t2 > 1.0 else (-1.0 if t2 < -1.0 else t2)
+    pitch = math.degrees(math.asin(t2))
+    
+    t0 = 2.0 * (w * z + x * y)
+    t1 = 1.0 - 2.0 * (z * z + x * x)
+    roll = math.degrees(math.atan2(t0, t1))
+    
+    return yaw, pitch, roll
 
 class FastFusion:
     def __init__(self, default_bias):
-        self.q = np.array([1.0, 0.0, 0.0, 0.0])
-        self.iterations = 0
+        self.q = [1.0, 0.0, 0.0, 0.0]
         self.gyro_bias = default_bias
+        self.iterations = 0
         self.device_level_count = 0
         self.grav_error_angle = 0.0
-        self.grav_error_axis = np.zeros(3)
-        self.accel_buffer = np.zeros((20, 3))
+        self.grav_error_axis = [0.0, 0.0, 0.0]
+        self.accel_buffer = [[0.0, 0.0, 0.0] for _ in range(20)]
         self.accel_idx = 0
         self.accel_count = 0
-        self.accel_sum = np.zeros(3)
+        self.accel_sum = [0.0, 0.0, 0.0]
+        self.world_accel_cache = [0.0, 0.0, 0.0]
 
-    def set_bias(self, bias):
-        self.gyro_bias = bias
+    def update(self, dt, gx, gy, gz, ax, ay, az):
+        gx -= self.gyro_bias[0]
+        gy -= self.gyro_bias[1]
+        gz -= self.gyro_bias[2]
 
-    def add_accel_sample(self, vec):
-        self.accel_sum -= self.accel_buffer[self.accel_idx]
-        self.accel_buffer[self.accel_idx] = vec
-        self.accel_sum += vec
+        g_mag_sq = gx*gx + gy*gy + gz*gz
+        if g_mag_sq < GYRO_DEADZONE * GYRO_DEADZONE:
+            gx = gy = gz = 0.0
+            g_mag = 0.0
+        else:
+            g_mag = math.sqrt(g_mag_sq)
+
+        if g_mag > 0.000001:
+            half_angle = g_mag * dt * 0.5
+            s = math.sin(half_angle) / g_mag
+            dq_w = math.cos(half_angle)
+            dq_x = gx * s
+            dq_y = gy * s
+            dq_z = gz * s
+            q_mult_inplace(self.q, dq_w, dq_x, dq_y, dq_z)
+            normalize_q(self.q)
+
+        q_rotate(self.q, (ax, ay, az), self.world_accel_cache)
+        wax, way, waz = self.world_accel_cache
+
+        self.iterations += 1
+        
+        old = self.accel_buffer[self.accel_idx]
+        self.accel_sum[0] += wax - old[0]
+        self.accel_sum[1] += way - old[1]
+        self.accel_sum[2] += waz - old[2]
+        
+        old[0], old[1], old[2] = wax, way, waz
         self.accel_idx = (self.accel_idx + 1) % 20
         if self.accel_count < 20: self.accel_count += 1
-        
-    def get_accel_mean(self):
-        if self.accel_count == 0: return np.zeros(3)
-        return self.accel_sum / self.accel_count
 
-    def update(self, dt, ang_vel, accel):
-        ang_vel_corr = ang_vel - self.gyro_bias
-        world_accel = q_rotate(self.q, accel)
-        self.iterations += 1
-        self.add_accel_sample(world_accel)
-        
-        ang_vel_length = np.linalg.norm(ang_vel_corr)
-        if ang_vel_length > 0.0001:
-            rot_axis = ang_vel_corr / ang_vel_length
-            rot_angle = ang_vel_length * dt
-            delta_q = q_from_rotvec(rot_axis, rot_angle)
-            self.q = q_mult(self.q, delta_q)
+        a_mag = math.sqrt(ax*ax + ay*ay + az*az)
+        is_stable = (abs(a_mag - 9.82) < GRAVITY_TOLERANCE and g_mag < 0.15)
 
-        accel_mag = np.linalg.norm(accel)
-        ang_vel_tolerance = 0.15
-        is_stable = (abs(accel_mag - 9.82) < GRAVITY_TOLERANCE and ang_vel_length < ang_vel_tolerance)
-        
         if is_stable:
             if self.device_level_count < STABILITY_THRESHOLD * 2:
                 self.device_level_count += 1
@@ -116,36 +132,56 @@ class FastFusion:
                 self.device_level_count -= 1
 
         if self.device_level_count > STABILITY_THRESHOLD:
-            if self.device_level_count % 5 == 0: 
-                accel_mean = self.get_accel_mean()
-                if abs(np.linalg.norm(accel_mean) - 9.82) < GRAVITY_TOLERANCE:
-                    tilt = np.array([accel_mean[2], 0.0, -accel_mean[0]])
-                    tilt_norm = np.linalg.norm(tilt)
-                    if tilt_norm > 0: tilt /= tilt_norm
+            if self.device_level_count % 5 == 0:
+                inv_count = 1.0 / self.accel_count
+                mx = self.accel_sum[0] * inv_count
+                my = self.accel_sum[1] * inv_count
+                mz = self.accel_sum[2] * inv_count
+                
+                m_norm = math.sqrt(mx*mx + my*my + mz*mz)
+                
+                if abs(m_norm - 9.82) < GRAVITY_TOLERANCE:
+                    tx, ty, tz = mz, 0.0, -mx
+                    t_norm = math.sqrt(tx*tx + ty*ty + tz*tz)
+                    if t_norm > 0:
+                        inv_t = 1.0 / t_norm
+                        tx *= inv_t; ty *= inv_t; tz *= inv_t
+
+                    dot = my / m_norm
+                    if dot > 1.0: dot = 1.0
+                    elif dot < -1.0: dot = -1.0
                     
-                    accel_mean_norm = accel_mean / np.linalg.norm(accel_mean)
-                    up = np.array([0.0, 1.0, 0.0])
-                    dot_product = np.clip(np.dot(up, accel_mean_norm), -1.0, 1.0)
-                    tilt_angle = np.arccos(dot_product)
-                    
-                    if tilt_angle > 0.01: 
+                    tilt_angle = math.acos(dot)
+
+                    if tilt_angle > 0.01:
                         self.grav_error_angle = tilt_angle
-                        self.grav_error_axis = tilt
+                        self.grav_error_axis[0] = tx
+                        self.grav_error_axis[1] = ty
+                        self.grav_error_axis[2] = tz
 
         if self.grav_error_angle > 0.05:
             if self.iterations < 2000:
                 use_angle = -self.grav_error_angle * 0.1
-                self.grav_error_angle += use_angle
             else:
-                factor = FILTER_GAIN * 0.01 * (5.0 * ang_vel_length + 1.0)
-                use_angle = -self.grav_error_angle * factor
-                self.grav_error_angle += use_angle
+                use_angle = -self.grav_error_angle * (FILTER_GAIN * 0.01 * (5.0 * g_mag + 1.0))
             
-            corr_q = q_from_rotvec(self.grav_error_axis, use_angle)
-            self.q = q_mult(corr_q, self.q)
-
-        n = np.linalg.norm(self.q)
-        if n > 0: self.q /= n
+            self.grav_error_angle += use_angle
+            
+            half_angle = use_angle * 0.5
+            s = math.sin(half_angle)
+            c = math.cos(half_angle)
+            
+            rx = self.grav_error_axis[0] * s
+            ry = self.grav_error_axis[1] * s
+            rz = self.grav_error_axis[2] * s
+            
+            qw, qx, qy, qz = self.q
+            self.q[0] = c*qw - rx*qx - ry*qy - rz*qz
+            self.q[1] = c*qx + rx*qw + ry*qz - rz*qy
+            self.q[2] = c*qy - rx*qz + ry*qw + rz*qx
+            self.q[3] = c*qz + rx*qy - ry*qx + rz*qw
+            
+            normalize_q(self.q)
 
 class KeyPoller:
     def __enter__(self):
@@ -172,7 +208,7 @@ def setup_device():
     VID, PID = 0x045E, 0x0659
     try:
         candidates = [d for d in hid.enumerate(VID, PID) if d["product_id"] == PID]
-        if not candidates: return None
+        if not candidates: return None, None
         
         target_idx = 0
         for arg in sys.argv:
@@ -186,33 +222,69 @@ def setup_device():
         time.sleep(0.05)
         try: hmd.write(bytes([0x02, 0x07] + [0] * 62))
         except OSError: pass
-        return hmd
-    except: return None
+        return hmd, path
+    except: return None, None
 
+def calibrate_gyro(hmd, packet_struct):
+    sys.stdout.write("\033[2J\033[H")
+    print("------------------------------------------------")
+    print("  CALIBRATING... KEEP DEVICE STILL (2 SEC)      ")
+    print("------------------------------------------------")
+    
+    samples = []
+    start = time.time()
+    
+    while time.time() - start < 2.0:
+        data = hmd.read(497, timeout_ms=20)
+        if not data or data[0] != 1: continue
+        try: 
+            tup = packet_struct.unpack_from(bytearray(data))
+            for i in range(4):
+                base_g = 9; s = i * 8
+                g0 = sum(tup[base_g + s : base_g + s + 8])
+                g1 = sum(tup[base_g + 32 + s : base_g + 32 + s + 8])
+                g2 = sum(tup[base_g + 64 + s : base_g + 64 + s + 8])
+                samples.append((g1, g2, g0))
+        except: continue
+        
+        p = int((time.time() - start) * 20)
+        sys.stdout.write(f"\r[{'=' * p}{' ' * (40 - p)}] {len(samples)} samples")
+        sys.stdout.flush()
+
+    if not samples: return [0.0, 0.0, 0.0]
+    
+    sums = [0.0, 0.0, 0.0]
+    for s in samples:
+        sums[0] += s[0]; sums[1] += s[1]; sums[2] += s[2]
+    
+    count = len(samples)
+    bias = [
+        (sums[0] / count) * GYRO_SCALE,
+        (sums[1] / count) * GYRO_SCALE,
+        (sums[2] / count) * GYRO_SCALE
+    ]
+    return bias
 
 def run():
-    hmd = setup_device()
-    if not hmd: 
-        print("Device not found."); return
+    hmd, path = setup_device()
+    if not hmd: print("Device not found."); return
 
     if "--wake" in sys.argv:
         time.sleep(1.0); hmd.close(); return
 
-    hardcoded_bias = np.array([0.00667593, 0.00111542, -0.00532668])
-    fusion = FastFusion(hardcoded_bias)
-
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     packet_struct = struct.Struct("< B 4H 4Q 96h 4Q 12i 4Q")
     udp_struct = struct.Struct("<dddddd")
     udp_buffer = bytearray(48)
-    
-    offsets = np.zeros(3)
-    centered = False
-    last_ts = 0
 
-    print("\n--- TRACKING ACTIVE ---")
-    print("Press [R] to Center, [Q] to Quit")
+    bias = calibrate_gyro(hmd, packet_struct)
+    print("\nCalibration complete. Driver active.")
+    print("Press [Q] to Quit, [R] to Center.")
+    
+    fusion = FastFusion(bias)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    off_y, off_p, off_r = 0.0, 0.0, 0.0
+    last_ts = 0
     
     try:
         with KeyPoller() as key_poller:
@@ -245,27 +317,20 @@ def run():
                     a1 = tup[base_a + 1*4 + i]
                     a2 = tup[base_a + 2*4 + i]
                     
-                    gyro_vec = np.array([g1, g2, g0]) * GYRO_SCALE
-                    accel_vec = np.array([a1, a2, a0]) * ACCEL_SCALE
-                    
-                    fusion.update(dt, gyro_vec, accel_vec)
+                    fusion.update(dt, 
+                                  g1 * GYRO_SCALE, g2 * GYRO_SCALE, g0 * GYRO_SCALE, 
+                                  a1 * ACCEL_SCALE, a2 * ACCEL_SCALE, a0 * ACCEL_SCALE)
 
                 y, p, r = q_to_euler(fusion.q)
                 
                 key = key_poller.check_key()
                 if key == 'q': break
-                if key == 'r': centered = False
+                if key == 'r': off_y, off_p, off_r = y, p, r
 
-                if not centered:
-                    offsets = np.array([y, p, r])
-                    centered = True
-                    print(f">> CENTERED <<                         ", end="\r")
-
-                fy = y - offsets[0]
-                fp = p - offsets[1]
-                fr = r - offsets[2]
-
-                udp_struct.pack_into(udp_buffer, 0, 0.0, 0.0, 0.0, -fp, fy, -fr)
+                fy = y - off_y
+                fp = p - off_p
+                fr = r - off_r
+                udp_struct.pack_into(udp_buffer, 0, 0.0, 0.0, 0.0, -fy, fr, -fp)
                 sock.sendto(udp_buffer, (UDP_IP, UDP_PORT))
 
     except KeyboardInterrupt: pass
@@ -273,6 +338,7 @@ def run():
         try: hmd.close()
         except: pass
         sock.close()
+        print("\nDriver Closed.")
 
 if __name__ == "__main__":
     run()
